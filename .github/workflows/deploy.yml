@@ -1,0 +1,115 @@
+name: Deploy Cloud Run Service
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    env:
+      CONFIG_FILE: project.env
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: 3.12.9
+
+      - name: Install script dependencies
+        run: pip install python-dotenv requests
+
+      - name: Load settings for GHA and GCloud
+        id: load_settings
+        run: python ./.github/scripts/load_env_vars.py ${{ env.CONFIG_FILE }}
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v3
+        with:
+          version: '>= 363.0.0'
+
+      - name: Authenticate to Google Cloud
+        id: auth
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+          project_id: ${{ env.PROJECT_ID }}
+          create_credentials_file: true
+
+      - name: Create Artifact Registry Repository (if not exists)
+        run: |
+          gcloud artifacts repositories create ${{ env.SERVICE_NAME }} \
+            --project=${{ env.PROJECT_ID }} \
+            --repository-format=docker \
+            --location=${{ env.REGION }} \
+            --description="${{ env.SERVICE_NAME }} docker repo" || true
+
+      - name: Configure Docker for Artifact Registry
+        run: gcloud auth configure-docker ${{ env.REGION }}-docker.pkg.dev --quiet
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and Push Docker Image
+        id: build-push
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          tags: ${{ env.REGION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.SERVICE_NAME }}/${{ env.SERVICE_NAME }}:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Deploy to Cloud Run
+        id: deploy
+        run: |
+          SERVICE_NAME="${{ env.SERVICE_NAME }}"
+          PROJECT_ID="${{ env.PROJECT_ID }}"
+          REGION="${{ env.REGION }}"
+          TIMEOUT="${{ env.TIMEOUT }}"
+          RUNTIME_SA="${{ env.RUNTIME_SERVICE_ACCOUNT_EMAIL }}"
+          GCLOUD_ENV_STRING='${{ steps.load_settings.outputs.gcloud_env_string }}'
+          IMAGE_TAG="${REGION}-docker.pkg.dev/${PROJECT_ID}/${SERVICE_NAME}/${SERVICE_NAME}:${GITHUB_SHA}"
+
+          if [ -z "$SERVICE_NAME" ] || [ -z "$PROJECT_ID" ] || [ -z "$REGION" ] || [ -z "$IMAGE_TAG" ]; then
+            echo "::error::Missing required environment variables for deployment."
+            exit 1
+          fi
+
+          GCLOUD_CMD="gcloud run deploy ${SERVICE_NAME}"
+          GCLOUD_CMD+=" --project=${PROJECT_ID}"
+          GCLOUD_CMD+=" --min-instances=0"
+          GCLOUD_CMD+=" --max-instances=1"
+          GCLOUD_CMD+=" --concurrency=1"
+          GCLOUD_CMD+=" --region=${REGION}"
+          GCLOUD_CMD+=" --timeout=31m"
+          GCLOUD_CMD+=" --image=${IMAGE_TAG}"
+          GCLOUD_CMD+=" --platform=managed"
+          GCLOUD_CMD+=" --allow-unauthenticated"
+          GCLOUD_CMD+=" --memory=1Gi"
+          GCLOUD_CMD+=" --cpu=1"
+          if [ -n "$TIMEOUT" ]; then GCLOUD_CMD+=" --timeout=${TIMEOUT}"; fi
+          if [ -n "$RUNTIME_SA" ]; then GCLOUD_CMD+=" --service-account=${RUNTIME_SA}"; fi
+          if [ -n "$GCLOUD_ENV_STRING" ]; then GCLOUD_CMD+=" --set-env-vars \"$GCLOUD_ENV_STRING\""; fi
+
+          start_time=$(date +%s)
+          eval "$GCLOUD_CMD" > deploy_output.log 2> deploy_error.log
+          exit_code=$?
+          end_time=$(date +%s)
+          duration=$((end_time - start_time))
+          echo "deploy_duration=${duration}" >> $GITHUB_OUTPUT
+
+          if [ $exit_code -ne 0 ]; then
+            error_snippet=$(tail -c 1000 deploy_error.log)
+            delimiter_err="EOF_ERR_$(date +%s%N)_${RANDOM}"
+            echo "deploy_error_snippet_raw<<${delimiter_err}" >> $GITHUB_OUTPUT
+            echo "${error_snippet}" >> $GITHUB_OUTPUT
+            echo "${delimiter_err}" >> $GITHUB_OUTPUT
+            exit 1
+          fi
+
