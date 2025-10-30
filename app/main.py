@@ -30,13 +30,14 @@ from fastapi import FastAPI
 
 from config import settings
 
-
+from loguru import logger as log
 @asynccontextmanager
 async def lifespan(*_) -> AsyncGenerator[None, None]:
     """
     FastAPI lifespan context manager for starting and stopping the Telegram bot.
     :yield: None
     """
+    log.debug("Starting Container...")
     yield
 
 
