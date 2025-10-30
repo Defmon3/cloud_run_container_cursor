@@ -1,0 +1,20 @@
+services:
+  service_name:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: service_name
+    environment:
+      - DEV_MODE=true
+      - GOOGLE_APPLICATION_CREDENTIALS=/run/secrets/gcp_sa
+    env_file:
+      - project.env
+    # Playwright/Chromium is more stable with a larger shared memory segment
+    shm_size: 1g
+    ports:
+      - "8080:8080"
+    secrets:
+      - gcp_sa
+secrets:
+  gcp_sa:
+    file: filepath
